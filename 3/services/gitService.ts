@@ -29,21 +29,47 @@ export interface GitConfig {
     corsProxy?: string;
 }
 
+// Helper function to recursively delete directory
+const deleteDir = async (pfs: any, dirPath: string) => {
+    try {
+        const entries = await pfs.readdir(dirPath);
+        for (const entry of entries) {
+            const fullPath = `${dirPath}/${entry}`;
+            try {
+                const stat = await pfs.stat(fullPath);
+                if (stat.isDirectory()) {
+                    await deleteDir(pfs, fullPath);
+                } else {
+                    await pfs.unlink(fullPath);
+                }
+            } catch (e) {
+                console.warn(`Failed to delete ${fullPath}:`, e);
+            }
+        }
+        await pfs.rmdir(dirPath);
+    } catch (e) {
+        console.warn(`Failed to delete directory ${dirPath}:`, e);
+    }
+};
+
 export const cloneRepository = async (config: GitConfig): Promise<string> => {
+    if (!config.repoUrl || !config.token) {
+        throw new Error("Repository URL and token are required.");
+    }
+
     const { fs, pfs } = initFS();
     const dir = '/repo';
 
     try {
         // Clean existing directory if it exists to ensure fresh clone
         try {
-            await pfs.readdir(dir);
-            // If it exists, we might want to delete it or just pull. 
-            // For simplicity in this "clone" action, we wipe it.
-            // Note: recursive delete in lightning-fs can be tricky, 
-            // so usually we rely on the user to "Clone" only once or clear data.
+            await pfs.stat(dir);
+            await deleteDir(pfs, dir);
         } catch (e) {
-            await pfs.mkdir(dir);
+            // Directory doesn't exist, which is fine
         }
+
+        await pfs.mkdir(dir);
 
         await git.clone({
             fs,
@@ -64,13 +90,17 @@ export const cloneRepository = async (config: GitConfig): Promise<string> => {
 };
 
 export const syncDocumentsToGit = async (documents: LegalDocument[], config: GitConfig, commitMessage: string): Promise<string> => {
+    if (!config.repoUrl || !config.token || !config.username || !config.email) {
+        throw new Error("Complete Git configuration required for push.");
+    }
+
     const { fs, pfs } = initFS();
     const dir = '/repo';
 
     try {
         // 1. Ensure repo exists (simple check)
         try {
-            await pfs.readdir(dir);
+            await pfs.stat(dir);
         } catch {
             throw new Error("Repository not initialized. Please Clone first.");
         }
@@ -78,7 +108,11 @@ export const syncDocumentsToGit = async (documents: LegalDocument[], config: Git
         // 2. Write Documents to Virtual FS
         // We structure them as individual JSON files in a 'documents' folder
         const docsDir = `${dir}/documents`;
-        try { await pfs.mkdir(docsDir); } catch {}
+        try { 
+            await pfs.mkdir(docsDir); 
+        } catch {
+            // Directory already exists, that's fine
+        }
 
         for (const doc of documents) {
             const filePath = `${docsDir}/${sanitizeFilename(doc.name)}.json`;
@@ -105,7 +139,8 @@ export const syncDocumentsToGit = async (documents: LegalDocument[], config: Git
             fs,
             http: git.http,
             dir,
-            url: config.repoUrl,
+            remote: 'origin',
+            ref: config.branch || 'main',
             corsProxy: config.corsProxy || PROXY_URL,
             onAuth: () => ({ username: config.token }),
         });
@@ -118,28 +153,55 @@ export const syncDocumentsToGit = async (documents: LegalDocument[], config: Git
 };
 
 export const pullDocumentsFromGit = async (config: GitConfig): Promise<LegalDocument[]> => {
+    if (!config.repoUrl || !config.token || !config.username || !config.email) {
+        throw new Error("Complete Git configuration required for pull.");
+    }
+
     const { fs, pfs } = initFS();
     const dir = '/repo';
 
     try {
-        // 1. Pull changes
-        await git.pull({
+        // 1. Ensure repo exists
+        try {
+            await pfs.stat(dir);
+        } catch {
+            throw new Error("Repository not initialized. Please Clone first.");
+        }
+
+        // 2. Fetch changes from remote
+        await git.fetch({
             fs,
             http: git.http,
             dir,
-            url: config.repoUrl,
             corsProxy: config.corsProxy || PROXY_URL,
+            ref: config.branch || 'main',
             singleBranch: true,
+            onAuth: () => ({ username: config.token }),
+        });
+
+        // 3. Merge fetched changes
+        await git.merge({
+            fs,
+            dir,
+            ours: config.branch || 'main',
+            theirs: `origin/${config.branch || 'main'}`,
             author: {
                 name: config.username,
                 email: config.email,
             },
-            onAuth: () => ({ username: config.token }),
         });
 
-        // 2. Read from Virtual FS
+        // 4. Read from Virtual FS
         const docsDir = `${dir}/documents`;
-        const files = await pfs.readdir(docsDir);
+        let files: string[] = [];
+        
+        try {
+            files = await pfs.readdir(docsDir);
+        } catch (e) {
+            console.warn("No documents folder found in repository");
+            return [];
+        }
+
         const docs: LegalDocument[] = [];
 
         for (const file of files) {
