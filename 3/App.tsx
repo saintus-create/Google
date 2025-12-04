@@ -52,7 +52,7 @@ const App: React.FC = () => {
 
   // Parallel Processing State
   const [activeWorkers, setActiveWorkers] = useState(0);
-  const processingRef = useRef(false);
+  const processingDocsRef = useRef<Set<string>>(new Set());
 
   // Git State
   const [isGitOpen, setIsGitOpen] = useState(false);
@@ -64,7 +64,11 @@ const App: React.FC = () => {
 
   // Derived counts for sidebar
   const processingCount = activeWorkers;
-  const pendingCount = documents.filter(d => !d.isProcessed && !fileStatuses[d.id]?.includes('processing')).length;
+  const pendingCount = documents.filter(d => 
+    !d.isProcessed && 
+    !fileStatuses[d.id]?.includes('processing') &&
+    !processingDocsRef.current.has(d.id)
+  ).length;
 
   const handleDbOperation = useCallback(async (operation: () => Promise<void>) => {
     setSaveStatus('syncing');
@@ -75,21 +79,24 @@ const App: React.FC = () => {
     } catch (e) {
         console.error("Database operation failed", e);
         setSaveStatus('error');
-    } finally {
-        // Ensure status doesn't get stuck if error is swallowed elsewhere
-        setSaveStatus(prev => prev === 'syncing' ? 'synced' : prev);
     }
   }, []);
 
-  // Worker Loop
+  // Worker Loop - Fixed to prevent race conditions and infinite loops
   useEffect(() => {
       const processNext = async () => {
           // Find next pending document that isn't already processing
-          const nextDoc = documents.find(d => !d.isProcessed && fileStatuses[d.id] !== 'processing' && fileStatuses[d.id] !== 'error');
+          const nextDoc = documents.find(d => 
+              !d.isProcessed && 
+              fileStatuses[d.id] !== 'processing' && 
+              fileStatuses[d.id] !== 'error' &&
+              !processingDocsRef.current.has(d.id)
+          );
           
           if (!nextDoc) return;
 
-          // Claim the work
+          // Claim the work immediately using ref to prevent race conditions
+          processingDocsRef.current.add(nextDoc.id);
           setActiveWorkers(prev => prev + 1);
           setFileStatuses(prev => ({ ...prev, [nextDoc.id]: 'processing' }));
 
@@ -114,7 +121,6 @@ const App: React.FC = () => {
               setLastSaved(new Date());
 
               // Update UI
-              // Use buffer logic or debouncing in real world, but for now functional update is safe
               setDocuments(prevDocs => prevDocs.map(d => d.id === nextDoc.id ? updatedDoc : d));
               setFileStatuses(prev => ({ ...prev, [nextDoc.id]: 'done' }));
 
@@ -122,26 +128,30 @@ const App: React.FC = () => {
               console.error(`Worker failed for ${nextDoc.name}:`, error);
               const errorMessage = getErrorMessage(error);
               
-              // With 7 models, if one fails, we mark error. The user can retry (re-upload).
-              
               const errorDoc = { ...nextDoc, error: errorMessage, isProcessed: true };
               await addOrUpdateDocument(errorDoc);
               
               setDocuments(prevDocs => prevDocs.map(d => d.id === nextDoc.id ? errorDoc : d));
               setFileStatuses(prev => ({ ...prev, [nextDoc.id]: 'error' }));
           } finally {
+              processingDocsRef.current.delete(nextDoc.id);
               setActiveWorkers(prev => prev - 1);
           }
       };
 
       // Trigger workers if we have capacity and work
       if (activeWorkers < MAX_CONCURRENCY) {
-          const hasPending = documents.some(d => !d.isProcessed && fileStatuses[d.id] !== 'processing' && fileStatuses[d.id] !== 'error');
+          const hasPending = documents.some(d => 
+              !d.isProcessed && 
+              fileStatuses[d.id] !== 'processing' && 
+              fileStatuses[d.id] !== 'error' &&
+              !processingDocsRef.current.has(d.id)
+          );
           if (hasPending) {
               processNext();
           }
       }
-  }, [activeWorkers, documents, fileStatuses]); // Re-run whenever a slot opens or docs change
+  }, [activeWorkers, documents, fileStatuses]);
 
 
   useEffect(() => {
@@ -149,14 +159,8 @@ const App: React.FC = () => {
       try {
         const storedDocs = await getAllDocuments();
         
-        // Reset processing statuses on reload in case user refreshed mid-process
-        const cleanDocs = storedDocs.map(d => {
-            // Check if it was stuck in 'processing' state in DB
-            return d;
-        });
-
         // Scan for failed docs due to "Decommissioned" error and auto-retry them
-        const fixedDocs = cleanDocs.map(d => {
+        const fixedDocs = storedDocs.map(d => {
             if (d.error && (d.error.includes("decommissioned") || d.error.includes("Rate limit"))) {
                 return { ...d, isProcessed: false, error: undefined }; // Reset to pending
             }
@@ -246,7 +250,6 @@ const App: React.FC = () => {
   }, []);
 
   const handleUpdateDocument = async (updatedDoc: LegalDocument) => {
-    // Only buffer heavy updates if necessary, but for single doc edits, direct update is fine.
     setDocuments(prevDocs => prevDocs.map(doc => doc.id === updatedDoc.id ? updatedDoc : doc));
     await handleDbOperation(() => addOrUpdateDocument(updatedDoc));
   };
@@ -289,6 +292,7 @@ const App: React.FC = () => {
         await handleDbOperation(clearAllDocuments);
         setDocuments([]);
         setFileStatuses({});
+        processingDocsRef.current.clear();
         setSelectedSnippetId(null);
         setSelectedCategory(null);
     }
@@ -307,6 +311,8 @@ const App: React.FC = () => {
 
   const handleGitImport = (importedDocs: LegalDocument[]) => {
       setDocuments(importedDocs);
+      processingDocsRef.current.clear();
+      
       // Re-hydrate statuses based on processed state
       const newStatuses: Record<string, FileStatus> = {};
       importedDocs.forEach(d => {
